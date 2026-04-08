@@ -1,0 +1,63 @@
+meta {
+  name: Validate History
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/v1/validate/history?limit=10
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  ## Validate History
+
+  Returns the last *limit* validation results in reverse-chronological order
+  (newest first).
+
+  The history ring holds a maximum of 50 entries and resets on server restart.
+  Every `POST /validate` call appends one entry.
+
+  ### Query params
+  | Param | Required | Default | Constraints | Description |
+  |-------|----------|---------|-------------|-------------|
+  | `limit` | No | `10` | 1–50 | Number of entries to return |
+
+  ### Expected response `200`
+  ```json
+  {
+    "total": 2,
+    "limit": 10,
+    "results": [
+      {
+        "file": "sales_v2.csv",
+        "total_rows": 10,
+        "valid_rows": 10,
+        "invalid_rows": 0,
+        "is_valid": true,
+        "errors": []
+      },
+      {
+        "file": "sales.csv",
+        "total_rows": 10,
+        "valid_rows": 7,
+        "invalid_rows": 3,
+        "is_valid": false,
+        "errors": [
+          {
+            "column": "quantity",
+            "check": "greater_than(0)",
+            "row_index": 7,
+            "failure_case": "-1"
+          }
+        ]
+      }
+    ]
+  }
+  ```
+}

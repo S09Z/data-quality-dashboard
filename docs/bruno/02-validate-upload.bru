@@ -1,0 +1,59 @@
+meta {
+  name: Validate – File Upload
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/v1/validate
+  body: multipartForm
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+body:multipart-form {
+  upload: @file(../../../data/sales.csv)
+}
+
+docs {
+  ## Validate – File Upload
+
+  Upload a CSV or Parquet file for validation via multipart/form-data.
+
+  - Accepted formats: `.csv`, `.parquet`
+  - Max size: 10 MB
+  - The suffix check runs **before** bytes are buffered — unsupported types
+    are rejected immediately with HTTP 400.
+
+  ### How to use
+  Replace `../../../data/sales.csv` with your local test file path.
+
+  ### Expected response `200` (invalid rows present)
+  ```json
+  {
+    "file": "sales.csv",
+    "total_rows": 10,
+    "valid_rows": 7,
+    "invalid_rows": 3,
+    "is_valid": false,
+    "errors": [
+      {
+        "column": "quantity",
+        "check": "greater_than(0)",
+        "row_index": 7,
+        "failure_case": "-1"
+      }
+    ]
+  }
+  ```
+
+  ### Error responses
+  | Status | Cause |
+  |--------|-------|
+  | 400    | Unsupported file extension |
+  | 429    | Rate limit exceeded (nginx: 5 req/s on /validate) |
+  | 500    | Internal pipeline failure |
+}

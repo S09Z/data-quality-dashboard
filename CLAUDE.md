@@ -52,14 +52,14 @@ Do not introduce:
 
 ## 3. Architecture
 
-```
+```text
 nginx (:443 / :80)
   └─► FastAPI app (:8000)          ← internal Docker network, never public
         ├── lifespan startup        DataPipeline.run() on DEFAULT_DATA_PATH
-        ├── POST /validate          DataPipeline.run() → ValidationResult
-        ├── GET  /summary           last SummaryResponse from app.state
-        ├── GET  /search?q=…        SearchEngine.query()
-        └── GET  /history           HistoryManager.latest()
+        ├── POST /v1/validate        DataPipeline.run() → ValidationResult
+        ├── GET  /v1/summary          last SummaryResponse from app.state
+        ├── GET  /v1/search?q=…       SearchEngine.query()
+        └── GET  /v1/validate/history  HistoryManager.latest()
 ```
 
 **Design patterns — do not remove or replace these without discussion:**
@@ -138,7 +138,8 @@ Rules:
 - Group related tests in `class Test*` inside `tests/test_pipeline.py`
 - HTTP client for route tests: `httpx.AsyncClient` with `httpx.ASGITransport(app=app)`
 - Patch at the **import location**, not the definition location
-  - ✅ `patch("src.api.DataPipeline.run")`
+  - ✅ `patch("src.routers.v1.pipeline.DataPipeline.run")`
+  - ✅ `patch("src.api.DataPipeline.run")` (lifespan-level patches only)
   - ❌ `patch("src.pipeline.DataPipeline.run")`
 - Use `tmp_path` or `monkeypatch` — never touch the real filesystem in unit tests
 - Inject `HistoryManager` state via `manager._items = [...]` directly in test setup
@@ -148,8 +149,13 @@ Rules:
 
 ## 8. File Placement Rules
 
-```
-src/api.py              Route handlers and lifespan only — no business logic
+```text
+src/api.py              App factory, lifespan — no route handlers
+src/routers/__init__.py Router package marker
+src/routers/v1/__init__.py  Aggregates all v1 routers into one APIRouter
+src/routers/v1/meta.py  GET /v1/health
+src/routers/v1/pipeline.py  POST /v1/validate, GET /v1/summary, GET /v1/validate/history
+src/routers/v1/search.py    GET /v1/search
 src/pipeline.py         DataPipeline class + compatibility shim functions
 src/schemas.py          Pydantic response models, Pandera schema, HistoryManager
 src/search.py           SearchEngine + Strategy classes + build_report_from_validation
@@ -158,6 +164,16 @@ src/logging_config.py   configure_logging() helper only
 
 tests/test_pipeline.py      All pytest tests
 tests/pentest_whitebox.py   Security scanner (run manually against live server)
+
+docs/openapi.yaml           OpenAPI 3.1 spec — source of truth for all endpoints
+docs/bruno/bruno.json       Bruno collection root
+docs/bruno/environments/    local.bru (port 8000) + docker.bru (nginx :443)
+docs/bruno/01-health.bru              GET /health
+docs/bruno/02-validate-upload.bru     POST /validate (multipart upload)
+docs/bruno/03-validate-path.bru       POST /validate (server-side path)
+docs/bruno/04-summary.bru             GET /summary
+docs/bruno/05-search.bru              GET /search
+docs/bruno/06-history.bru             GET /validate/history
 
 nginx/nginx.conf        Reverse proxy config — rate limits, TLS, headers
 Dockerfile              Multi-stage build — edit only to change base image or deps
@@ -169,8 +185,10 @@ scripts/gen_certs.sh    One-off cert generation for local TLS
 Rules:
 
 - New business logic → `src/pipeline.py` or a new `src/<feature>.py` module
-- New API route → `src/api.py` only
+- New API route → add handler to the appropriate `src/routers/v1/<tag>.py` file
+- New API version → create `src/routers/v2/` and mount it under `/v2` in `src/api.py`
 - New config knob → add to `Settings` in `src/config.py` **and** document in `.env.example`
+- New or changed endpoint → update **both** `docs/openapi.yaml` **and** the matching `docs/bruno/*.bru` file
 - Do not create a new module for single-function use — add it to the closest existing module
 - Module filename must match the primary class or concept it exports
 
@@ -178,50 +196,57 @@ Rules:
 
 ## 9. Safe-Change Rules
 
-- Do not rename or remove any existing API route (`/validate`, `/summary`, `/search`, `/history`, `/health`)
+- Do not rename or remove any existing API route (`/v1/validate`, `/v1/summary`, `/v1/search`, `/v1/validate/history`, `/v1/health`)
 - Do not change the suffix-check order in `validate_file` — the check **must** run before `await upload.read()`
 - Do not modify `nginx/nginx.conf` security headers without noting it in the PR description
 - Do not modify the Pandera `SalesSchema` columns without updating all affected tests
 - Do not change `HistoryManager.push` / `latest` signatures — used in both `api.py` and tests
 - Do not change `DataPipeline.run()` return type — it must remain `tuple[ValidationResult, SummaryResponse]`
+- Do not change a response model field name or type without updating `docs/openapi.yaml` schemas in the same PR
+- Do not add a new query / body parameter without adding it to the matching `.bru` file and `docs/openapi.yaml`
 - Flag major architectural changes (new pattern, new dependency, new service) **before** implementing — describe the change and wait for approval
 
 ---
 
 ## 10. Commands
 
+All common tasks are wrapped in `make` — run `make` with no args to see the full list.
+
 ```bash
-# Dependencies
-uv sync --frozen --all-extras             # install prod + dev deps
-uv add <package>                          # add a new dependency
-uv add --dev <package>                    # add a dev-only dependency
+# ── Quick-start ───────────────────────────────────────────────────────────
+make dev          # install deps + start hot-reload server on :8000
+make up           # build Docker image, generate certs, start app + nginx
+make up-detach    # same as up but runs in the background
 
-# Development
-uv run uvicorn src.api:app --reload       # dev server on localhost:8000
-uv run python main.py                     # prod-style server (no reload)
+# ── Code quality (run before every commit) ───────────────────────────────
+make lint         # ruff check + format check (read-only)
+make fix          # ruff auto-fix + format (writes files)
+make test         # pytest with coverage, fails if < 80 %
+make test-fast    # pytest -x (stop on first failure)
+make pentest      # spin up server + run pentest_whitebox.py
 
-# Lint & format
-uv run ruff check src/ tests/ main.py           # lint (check only)
-uv run ruff check src/ tests/ main.py --fix     # lint + auto-fix
-uv run ruff format src/ tests/ main.py          # format
+# ── Docker helpers ────────────────────────────────────────────────────────
+make smoke        # curl -k https://localhost/health
+make logs         # tail all service logs
+make logs-app     # tail app logs only
+make nginx-reload # reload nginx config without restart
+make down         # stop and remove all containers
 
-# Tests
-uv run pytest --cov=src --cov-report=term-missing   # with coverage
-uv run pytest -x                                     # stop on first failure
-uv run pytest -k "TestDataPipeline"                  # run one class
+# ── Utilities ─────────────────────────────────────────────────────────────
+make certs        # generate self-signed TLS certs (skips if already exist)
+make clean        # remove .venv, caches, coverage artefacts
+```
 
-# Security scan (requires live server)
-uv run uvicorn src.api:app --port 8000 &
-uv run python tests/pentest_whitebox.py
-pkill -f "uvicorn src.api:app"
+**Raw commands** (when make is not available):
 
-# Docker
-bash scripts/gen_certs.sh                         # generate self-signed cert (first time only)
-docker compose up --build -d                      # build + start app and nginx
-curl -k https://localhost/health                  # smoke-test
-docker compose logs -f app                        # tail app logs
-docker compose exec nginx nginx -s reload         # reload nginx config (no restart)
-docker compose down                               # stop and remove containers
+```bash
+# Package management
+uv sync --frozen --all-extras   # install prod + dev deps
+uv add <package>                # add a new runtime dependency
+uv add --dev <package>          # add a dev-only dependency
+
+# Single test class
+uv run pytest -k "TestDataPipeline" -v
 ```
 
 ---

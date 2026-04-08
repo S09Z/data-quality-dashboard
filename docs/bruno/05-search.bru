@@ -1,0 +1,52 @@
+meta {
+  name: Search
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{baseUrl}}/v1/search?q=null values&top_k=5
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  ## Search
+
+  BM25 keyword search (default) or semantic search (`USE_SEMANTIC_SEARCH=true`)
+  over all indexed validation reports.
+
+  The search index is rebuilt automatically on every `POST /validate` call.
+
+  ### Query params
+  | Param | Required | Default | Constraints | Description |
+  |-------|----------|---------|-------------|-------------|
+  | `q` | **Yes** | — | 1–500 chars | Search query string |
+  | `top_k` | No | `5` | 1–20 | Max number of results to return |
+
+  ### Try these queries
+  - `null values`
+  - `quantity failed`
+  - `unit_price region`
+  - `FAILED`
+
+  ### Expected response `200`
+  ```json
+  {
+    "query": "null values",
+    "results": [
+      "File: sales.csv\nTotal rows: 10\nValid rows: 7\nInvalid rows: 3\nStatus: FAILED\n  - Column 'unit_price' failed check 'not_nullable' at row 8 (value: None)"
+    ],
+    "total": 1
+  }
+  ```
+
+  ### Error responses
+  | Status | Cause |
+  |--------|-------|
+  | 422    | Missing `q` param or `q` exceeds 500 chars |
+}
