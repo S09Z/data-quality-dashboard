@@ -1,0 +1,497 @@
+openapi: "3.1.0"
+
+info:
+  title: Data Quality Dashboard
+  description: |
+    Validate CSV / Parquet sales data files, explore column statistics,
+    and search past validation reports via BM25 or semantic search.
+
+    ## Authentication
+    No authentication required for v0.1.x (internal / private network only).
+    All traffic must be routed through the nginx reverse proxy.
+
+    ## Rate limits (nginx)
+    - Global:   30 req/s per IP (burst 60)
+    - /validate: 5 req/s per IP (burst 10)
+
+    ## File upload limits
+    - Max upload size: 10 MB (enforced by nginx + app)
+    - Accepted formats: `.csv`, `.parquet`
+  version: "0.1.0"
+  contact:
+    name: S09Z
+    url: https://github.com/S09Z/data-quality-dashboard
+
+servers:
+  - url: http://localhost:8000
+    description: Local dev (uvicorn, no proxy)
+  - url: https://localhost
+    description: Local Docker (nginx TLS, self-signed cert)
+
+tags:
+  - name: meta
+    description: Health and liveness probes
+  - name: pipeline
+    description: Validate files and explore results
+  - name: search
+    description: Full-text search over validation history
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+paths:
+
+  # ── Health ──────────────────────────────────────────────────────────────────
+  /v1/health:
+    get:
+      operationId: health
+      summary: Liveness check
+      description: |
+        Returns `{ "status": "ok" }` when the service is running.
+        Use this for Docker / load-balancer health probes.
+      tags: [meta]
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                version: "0.1.0"
+
+  # ── Validate ─────────────────────────────────────────────────────────────────
+  /v1/validate:
+    post:
+      operationId: validate_file
+      summary: Validate a CSV or Parquet file
+      description: |
+        Run the Polars + Pandera validation pipeline against a data file.
+
+        **Two ways to supply data (mutually exclusive; `upload` wins if both given):**
+
+        1. `upload` — multipart/form-data file upload (max 10 MB, `.csv` / `.parquet`)
+        2. `file_path` — query param pointing to a server-side file path
+
+        Falls back to `data/sales.csv` when neither is supplied.
+
+        The validated result is pushed to the in-memory history ring and the
+        search index is re-indexed with the new report.
+      tags: [pipeline]
+      parameters:
+        - name: file_path
+          in: query
+          required: false
+          description: Absolute server-side path to a `.csv` or `.parquet` file.
+          schema:
+            type: string
+            example: /app/data/sales.csv
+      requestBody:
+        required: false
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                upload:
+                  type: string
+                  format: binary
+                  description: CSV or Parquet file (max 10 MB).
+      responses:
+        "200":
+          description: Validation complete
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationResult"
+              examples:
+                valid_file:
+                  summary: All rows pass validation
+                  value:
+                    file: sales.csv
+                    total_rows: 10
+                    valid_rows: 10
+                    invalid_rows: 0
+                    is_valid: true
+                    errors: []
+                invalid_file:
+                  summary: Some rows fail validation
+                  value:
+                    file: sales.csv
+                    total_rows: 10
+                    valid_rows: 7
+                    invalid_rows: 3
+                    is_valid: false
+                    errors:
+                      - column: quantity
+                        check: greater_than(0)
+                        row_index: 7
+                        failure_case: "-1"
+                      - column: unit_price
+                        check: greater_than(0.0)
+                        row_index: 9
+                        failure_case: "0"
+        "400":
+          description: Unsupported file type or bad request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorDetail"
+              example:
+                detail: "Uploaded file type '.sh' is not supported. Use .csv or .parquet."
+        "404":
+          description: File not found (server-side path)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorDetail"
+              example:
+                detail: "File not found: /app/data/missing.csv"
+        "429":
+          description: Rate limit exceeded (nginx)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorDetail"
+              example:
+                detail: Too Many Requests
+        "500":
+          description: Internal pipeline error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorDetail"
+              example:
+                detail: "Failed to parse file: unexpected schema mismatch"
+
+  # ── Summary ──────────────────────────────────────────────────────────────────
+  /v1/summary:
+    get:
+      operationId: get_summary
+      summary: Column statistics for the last validated file
+      description: |
+        Returns aggregate statistics (min / max / mean / null count) for each
+        numeric column, plus region distribution and total revenue.
+
+        Requires at least one prior call to `POST /validate`.
+        Resets on server restart.
+      tags: [pipeline]
+      responses:
+        "200":
+          description: Summary statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SummaryResponse"
+              example:
+                file: sales.csv
+                total_rows: 10
+                total_revenue: 1024.68
+                columns:
+                  - column: quantity
+                    min: 1.0
+                    max: 10.0
+                    mean: 4.3
+                    null_count: 0
+                  - column: unit_price
+                    min: 9.99
+                    max: 99.99
+                    mean: 32.49
+                    null_count: 1
+                regions:
+                  East: 2
+                  North: 3
+                  South: 3
+                  West: 2
+        "404":
+          description: No validation run yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorDetail"
+              example:
+                detail: "No summary available yet. Call POST /validate first."
+
+  # ── Search ───────────────────────────────────────────────────────────────────
+  /v1/search:
+    get:
+      operationId: search
+      summary: Search validation reports
+      description: |
+        BM25 keyword search (default) or semantic search (when
+        `USE_SEMANTIC_SEARCH=true`) over all indexed validation reports.
+
+        Results are ranked by relevance and returned as plain-text report
+        snippets. The search index is rebuilt on every `POST /validate` call.
+      tags: [search]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query (1–500 characters).
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 500
+            example: null values unit_price
+        - name: top_k
+          in: query
+          required: false
+          description: Number of results to return (1–20, default 5).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 5
+            example: 5
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+              example:
+                query: null values
+                results:
+                  - "File: sales.csv\nTotal rows: 10\nValid rows: 7\nInvalid rows: 3\nStatus: FAILED\n  - Column 'unit_price' failed check 'not_nullable' at row 8 (value: None)"
+                total: 1
+        "422":
+          description: Query validation error (missing or too long)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorDetail"
+
+  # ── History ──────────────────────────────────────────────────────────────────
+  /v1/validate/history:
+    get:
+      operationId: get_history
+      summary: Recent validation history
+      description: |
+        Returns the last *limit* validation results in reverse-chronological
+        order (newest first).
+
+        The history ring holds a maximum of 50 entries and resets on server
+        restart. Every `POST /validate` call appends to the ring.
+      tags: [pipeline]
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Number of past results to return (1–50, default 10).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 10
+            example: 10
+      responses:
+        "200":
+          description: Validation history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryResponse"
+              example:
+                total: 2
+                limit: 10
+                results:
+                  - file: sales_v2.csv
+                    total_rows: 10
+                    valid_rows: 10
+                    invalid_rows: 0
+                    is_valid: true
+                    errors: []
+                  - file: sales.csv
+                    total_rows: 10
+                    valid_rows: 7
+                    invalid_rows: 3
+                    is_valid: false
+                    errors:
+                      - column: quantity
+                        check: greater_than(0)
+                        row_index: 7
+                        failure_case: "-1"
+
+# =============================================================================
+# Components
+# =============================================================================
+
+components:
+  schemas:
+
+    # ── Shared error shape ────────────────────────────────────────────────────
+    ErrorDetail:
+      type: object
+      description: FastAPI default error envelope
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          description: Human-readable description of the error.
+          example: "File not found: /app/data/missing.csv"
+
+    # ── HealthResponse ────────────────────────────────────────────────────────
+    HealthResponse:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          example: ok
+        version:
+          type: string
+          example: "0.1.0"
+
+    # ── ValidationError ───────────────────────────────────────────────────────
+    ValidationError:
+      type: object
+      description: A single Pandera validation failure for one row/column.
+      required: [column, check]
+      properties:
+        column:
+          type: string
+          description: Name of the column that failed validation.
+          example: quantity
+        check:
+          type: string
+          description: Pandera check name that failed.
+          example: greater_than(0)
+        row_index:
+          type: integer
+          nullable: true
+          description: Zero-based row index of the failing row (null if row-agnostic).
+          example: 7
+        failure_case:
+          description: The actual value that caused the failure.
+          nullable: true
+          example: "-1"
+
+    # ── ValidationResult ──────────────────────────────────────────────────────
+    ValidationResult:
+      type: object
+      description: Full result of one validation pipeline run.
+      required: [file, total_rows, valid_rows, invalid_rows, errors, is_valid]
+      properties:
+        file:
+          type: string
+          description: Original filename or path label.
+          example: sales.csv
+        total_rows:
+          type: integer
+          minimum: 0
+          example: 10
+        valid_rows:
+          type: integer
+          minimum: 0
+          example: 7
+        invalid_rows:
+          type: integer
+          minimum: 0
+          example: 3
+        is_valid:
+          type: boolean
+          description: "`true` when `invalid_rows == 0`."
+          example: false
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationError"
+
+    # ── ColumnSummary ─────────────────────────────────────────────────────────
+    ColumnSummary:
+      type: object
+      description: Descriptive statistics for one numeric column.
+      required: [column, null_count]
+      properties:
+        column:
+          type: string
+          example: quantity
+        min:
+          type: number
+          nullable: true
+          example: 1.0
+        max:
+          type: number
+          nullable: true
+          example: 10.0
+        mean:
+          type: number
+          nullable: true
+          example: 4.3
+        null_count:
+          type: integer
+          minimum: 0
+          example: 0
+
+    # ── SummaryResponse ───────────────────────────────────────────────────────
+    SummaryResponse:
+      type: object
+      required: [file, total_rows, total_revenue, columns, regions]
+      properties:
+        file:
+          type: string
+          example: sales.csv
+        total_rows:
+          type: integer
+          minimum: 0
+          example: 10
+        total_revenue:
+          type: number
+          format: float
+          description: Sum of `quantity × unit_price` across all valid rows.
+          example: 1024.68
+        columns:
+          type: array
+          items:
+            $ref: "#/components/schemas/ColumnSummary"
+        regions:
+          type: object
+          description: Count of rows per region value.
+          additionalProperties:
+            type: integer
+          example:
+            East: 2
+            North: 3
+
+    # ── SearchResponse ────────────────────────────────────────────────────────
+    SearchResponse:
+      type: object
+      required: [query, results, total]
+      properties:
+        query:
+          type: string
+          example: null values
+        results:
+          type: array
+          items:
+            type: string
+          description: Ranked plain-text report snippets.
+        total:
+          type: integer
+          minimum: 0
+          example: 1
+
+    # ── HistoryResponse ───────────────────────────────────────────────────────
+    HistoryResponse:
+      type: object
+      required: [total, limit, results]
+      properties:
+        total:
+          type: integer
+          description: Total entries currently in the history ring.
+          minimum: 0
+          example: 2
+        limit:
+          type: integer
+          description: The `limit` param used for this request.
+          example: 10
+        results:
+          type: array
+          description: Validation results, newest first.
+          items:
+            $ref: "#/components/schemas/ValidationResult"

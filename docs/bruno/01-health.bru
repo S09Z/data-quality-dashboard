@@ -1,0 +1,31 @@
+meta {
+  name: Health Check
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/v1/health
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  ## Health Check
+
+  Liveness probe — returns `{ "status": "ok" }` when the service is running.
+
+  Use this for Docker / load-balancer health checks.
+
+  ### Expected response `200`
+  ```json
+  {
+    "status": "ok",
+    "version": "0.1.0"
+  }
+  ```
+}

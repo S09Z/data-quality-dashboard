@@ -202,45 +202,47 @@ def client():
 
 class TestAPI:
     def test_health_ok(self, client: TestClient):
-        resp = client.get("/health")
+        resp = client.get("/v1/health")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
 
     def test_validate_default_file(self, client: TestClient):
-        resp = client.post("/validate")
+        resp = client.post("/v1/validate")
         assert resp.status_code == 200
         data = resp.json()
         assert "total_rows" in data
         assert "is_valid" in data
 
     def test_validate_missing_file(self, client: TestClient):
-        resp = client.post("/validate", params={"file_path": "/nonexistent/file.csv"})
+        resp = client.post(
+            "/v1/validate", params={"file_path": "/nonexistent/file.csv"}
+        )
         assert resp.status_code == 404
 
     def test_validate_unsupported_format(self, client: TestClient):
-        resp = client.post("/validate", params={"file_path": "/tmp/data.txt"})
+        resp = client.post("/v1/validate", params={"file_path": "/tmp/data.txt"})
         assert resp.status_code in {400, 404}
 
     def test_summary_available_after_validate(self, client: TestClient):
         # validate first to populate state
-        client.post("/validate")
-        resp = client.get("/summary")
+        client.post("/v1/validate")
+        resp = client.get("/v1/summary")
         assert resp.status_code == 200
         data = resp.json()
         assert "total_revenue" in data
         assert "regions" in data
 
     def test_search_returns_results(self, client: TestClient):
-        client.post("/validate")
-        resp = client.get("/search", params={"q": "validation"})
+        client.post("/v1/validate")
+        resp = client.get("/v1/search", params={"q": "validation"})
         assert resp.status_code == 200
         data = resp.json()
         assert "results" in data
         assert isinstance(data["results"], list)
 
     def test_search_missing_query(self, client: TestClient):
-        resp = client.get("/search")
+        resp = client.get("/v1/search")
         assert resp.status_code == 422  # query param 'q' is required
 
 
@@ -514,7 +516,7 @@ def fresh_client():
 class TestAPIExtra:
     def test_validate_returns_error_list(self, client: TestClient):
         """POST /validate on sales.csv should return a non-empty errors list."""
-        resp = client.post("/validate")
+        resp = client.post("/v1/validate")
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data["errors"], list)
@@ -522,7 +524,7 @@ class TestAPIExtra:
 
     def test_validate_error_structure(self, client: TestClient):
         """Each error object must have column, check, row_index, failure_case."""
-        resp = client.post("/validate")
+        resp = client.post("/v1/validate")
         data = resp.json()
         for err in data["errors"]:
             assert "column" in err
@@ -534,7 +536,7 @@ class TestAPIExtra:
         """POST /validate on a valid temp CSV file should return is_valid=true."""
         p = tmp_path / "valid.csv"
         p.write_text(VALID_CSV)
-        resp = client.post("/validate", params={"file_path": str(p)})
+        resp = client.post("/v1/validate", params={"file_path": str(p)})
         assert resp.status_code == 200
         assert resp.json()["is_valid"] is True
 
@@ -542,7 +544,7 @@ class TestAPIExtra:
         """POST /validate on a temp CSV with bad rows returns is_valid=false."""
         p = tmp_path / "bad.csv"
         p.write_text(INVALID_CSV_NEG_QTY)
-        resp = client.post("/validate", params={"file_path": str(p)})
+        resp = client.post("/v1/validate", params={"file_path": str(p)})
         assert resp.status_code == 200
         assert resp.json()["is_valid"] is False
 
@@ -552,15 +554,15 @@ class TestAPIExtra:
         """An existing file with .txt extension should return HTTP 400."""
         p = tmp_path / "data.txt"
         p.write_text("some data\n")
-        resp = client.post("/validate", params={"file_path": str(p)})
+        resp = client.post("/v1/validate", params={"file_path": str(p)})
         assert resp.status_code == 400
 
     def test_summary_after_valid_file(self, client: TestClient, tmp_path: Path):
         """After validating a clean file, summary total_revenue should be correct."""
         p = tmp_path / "valid2.csv"
         p.write_text(VALID_CSV)
-        client.post("/validate", params={"file_path": str(p)})
-        resp = client.get("/summary")
+        client.post("/v1/validate", params={"file_path": str(p)})
+        resp = client.get("/v1/summary")
         assert resp.status_code == 200
         data = resp.json()
         # 5*9.99 + 3*19.99 + 10*49.99
@@ -572,20 +574,20 @@ class TestAPIExtra:
             from src.api import app as fresh_app
 
             with TestClient(fresh_app, raise_server_exceptions=False) as c:
-                resp = c.get("/summary")
+                resp = c.get("/v1/summary")
                 assert resp.status_code == 404
 
     def test_search_top_k_param(self, client: TestClient):
         """GET /search with top_k=1 should return at most 1 result."""
-        client.post("/validate")
-        resp = client.get("/search", params={"q": "validation", "top_k": 1})
+        client.post("/v1/validate")
+        resp = client.get("/v1/search", params={"q": "validation", "top_k": 1})
         assert resp.status_code == 200
         assert len(resp.json()["results"]) <= 1
 
     def test_search_response_schema(self, client: TestClient):
         """Search response must include query, results, and total fields."""
-        client.post("/validate")
-        resp = client.get("/search", params={"q": "error"})
+        client.post("/v1/validate")
+        resp = client.get("/v1/search", params={"q": "error"})
         data = resp.json()
         assert "query" in data
         assert "results" in data
@@ -595,7 +597,7 @@ class TestAPIExtra:
 
     def test_health_version_field(self, client: TestClient):
         """Health endpoint must return a version string."""
-        resp = client.get("/health")
+        resp = client.get("/v1/health")
         assert "version" in resp.json()
         assert isinstance(resp.json()["version"], str)
 
@@ -605,7 +607,7 @@ class TestAPIExtra:
             from src.api import app as fresh_app
 
             with TestClient(fresh_app, raise_server_exceptions=False) as c:
-                resp = c.get("/health")
+                resp = c.get("/v1/health")
                 assert resp.status_code == 200
 
     def test_validate_returns_500_on_internal_error(self, tmp_path: Path):
@@ -615,10 +617,11 @@ class TestAPIExtra:
         p = tmp_path / "ok.csv"
         p.write_text(VALID_CSV)
         with patch(
-            "src.api.DataPipeline.run", side_effect=RuntimeError("unexpected crash")
+            "src.routers.v1.pipeline.DataPipeline.run",
+            side_effect=RuntimeError("unexpected crash"),
         ):
             with TestClient(fresh_app, raise_server_exceptions=False) as c:
-                resp = c.post("/validate", params={"file_path": str(p)})
+                resp = c.post("/v1/validate", params={"file_path": str(p)})
                 assert resp.status_code == 500
                 assert "unexpected crash" in resp.json()["detail"]
 
@@ -627,7 +630,7 @@ class TestAPIExtra:
     def test_upload_valid_csv(self, client: TestClient):
         """POST /validate with a valid uploaded CSV should return is_valid=true."""
         resp = client.post(
-            "/validate",
+            "/v1/validate",
             files={"upload": ("valid.csv", VALID_CSV.encode(), "text/csv")},
         )
         assert resp.status_code == 200
@@ -638,7 +641,7 @@ class TestAPIExtra:
     def test_upload_invalid_csv(self, client: TestClient):
         """POST /validate with uploaded CSV containing bad rows returns is_valid=false."""
         resp = client.post(
-            "/validate",
+            "/v1/validate",
             files={"upload": ("bad.csv", INVALID_CSV_NEG_QTY.encode(), "text/csv")},
         )
         assert resp.status_code == 200
@@ -647,7 +650,7 @@ class TestAPIExtra:
     def test_upload_unsupported_extension(self, client: TestClient):
         """Uploading a .txt file should return HTTP 400."""
         resp = client.post(
-            "/validate",
+            "/v1/validate",
             files={"upload": ("data.txt", b"col1,col2\n1,2\n", "text/plain")},
         )
         assert resp.status_code == 400
@@ -660,7 +663,7 @@ class TestAPIExtra:
         p = tmp_path / "invalid.csv"
         p.write_text(INVALID_CSV_NEG_QTY)
         resp = client.post(
-            "/validate",
+            "/v1/validate",
             params={"file_path": str(p)},
             files={"upload": ("valid.csv", VALID_CSV.encode(), "text/csv")},
         )
@@ -675,7 +678,7 @@ class TestAPIExtra:
 
         p = tmp_path / "sales.parquet"
         pl.read_csv(io.StringIO(VALID_CSV)).write_parquet(str(p))
-        resp = client.post("/validate", params={"file_path": str(p)})
+        resp = client.post("/v1/validate", params={"file_path": str(p)})
         assert resp.status_code == 200
         assert resp.json()["is_valid"] is True
         assert resp.json()["total_rows"] == 3
@@ -862,12 +865,12 @@ class TestHistory:
 
     def test_history_returns_200(self, client: TestClient):
         """GET /validate/history must always return HTTP 200."""
-        resp = client.get("/validate/history")
+        resp = client.get("/v1/validate/history")
         assert resp.status_code == 200
 
     def test_history_response_schema(self, client: TestClient):
         """Response must have total, limit, results keys."""
-        resp = client.get("/validate/history")
+        resp = client.get("/v1/validate/history")
         data = resp.json()
         assert "total" in data
         assert "limit" in data
@@ -876,23 +879,23 @@ class TestHistory:
 
     def test_history_populated_after_startup(self, client: TestClient):
         """Startup pipeline calls validate, so history should have ≥1 entry."""
-        resp = client.get("/validate/history")
+        resp = client.get("/v1/validate/history")
         data = resp.json()
         # lifespan runs a validate on sales.csv — must appear in history
         assert data["total"] >= 1
 
     def test_history_grows_after_validate(self, client: TestClient, tmp_path: Path):
         """Calling POST /validate should increase total count by 1."""
-        before = client.get("/validate/history").json()["total"]
+        before = client.get("/v1/validate/history").json()["total"]
         p = tmp_path / "extra.csv"
         p.write_text(VALID_CSV)
-        client.post("/validate", params={"file_path": str(p)})
-        after = client.get("/validate/history").json()["total"]
+        client.post("/v1/validate", params={"file_path": str(p)})
+        after = client.get("/v1/validate/history").json()["total"]
         assert after == before + 1
 
     def test_history_limit_param(self, client: TestClient):
         """limit=1 must return at most 1 result."""
-        resp = client.get("/validate/history", params={"limit": 1})
+        resp = client.get("/v1/validate/history", params={"limit": 1})
         assert resp.status_code == 200
         data = resp.json()
         assert data["limit"] == 1
@@ -900,14 +903,14 @@ class TestHistory:
 
     def test_history_limit_default(self, client: TestClient):
         """Default limit is 10 — response must reflect that."""
-        resp = client.get("/validate/history")
+        resp = client.get("/v1/validate/history")
         data = resp.json()
         assert data["limit"] == 10
         assert len(data["results"]) <= 10
 
     def test_history_results_are_validation_results(self, client: TestClient):
         """Every item in results must look like a ValidationResult."""
-        resp = client.get("/validate/history")
+        resp = client.get("/v1/validate/history")
         for item in resp.json()["results"]:
             assert "file" in item
             assert "total_rows" in item
@@ -925,10 +928,10 @@ class TestHistory:
         p1.write_text(VALID_CSV)
         p2.write_text(VALID_CSV)
 
-        client.post("/validate", params={"file_path": str(p1)})
-        client.post("/validate", params={"file_path": str(p2)})
+        client.post("/v1/validate", params={"file_path": str(p1)})
+        client.post("/v1/validate", params={"file_path": str(p2)})
 
-        resp = client.get("/validate/history", params={"limit": 2})
+        resp = client.get("/v1/validate/history", params={"limit": 2})
         results = resp.json()["results"]
         assert len(results) == 2
         # The most-recently validated file (p2) must come first
@@ -937,7 +940,8 @@ class TestHistory:
 
     def test_history_bounded_at_max_size(self):
         """History must never exceed HISTORY_MAX_SIZE=50 entries."""
-        from src.api import HISTORY_MAX_SIZE, app
+        from src.api import app
+        from src.routers.v1.pipeline import HISTORY_MAX_SIZE
         from src.schemas import HistoryManager
 
         # Build a fresh app context with manually-inflated history
@@ -963,11 +967,11 @@ class TestHistory:
                 f.write(VALID_CSV)
                 p_tmp = f.name
             try:
-                c.post("/validate", params={"file_path": p_tmp})
+                c.post("/v1/validate", params={"file_path": p_tmp})
             finally:
                 Path(p_tmp).unlink(missing_ok=True)
 
-            resp = c.get("/validate/history", params={"limit": 50})
+            resp = c.get("/v1/validate/history", params={"limit": 50})
             data = resp.json()
             assert data["total"] <= HISTORY_MAX_SIZE
 
@@ -980,15 +984,15 @@ class TestHistory:
         from src.api import app as isolated_app
 
         with TestClient(isolated_app) as c:
-            initial_total = c.get("/validate/history").json()["total"]
+            initial_total = c.get("/v1/validate/history").json()["total"]
             # Add 3 entries so we know exactly how many were added here
             for i in range(3):
                 p = tmp_path / f"batch_{i}.csv"
                 p.write_text(VALID_CSV)
-                c.post("/validate", params={"file_path": str(p)})
+                c.post("/v1/validate", params={"file_path": str(p)})
 
-            resp_full = c.get("/validate/history", params={"limit": 50})
-            resp_one = c.get("/validate/history", params={"limit": 1})
+            resp_full = c.get("/v1/validate/history", params={"limit": 50})
+            resp_one = c.get("/v1/validate/history", params={"limit": 1})
 
         # total must be the same regardless of limit
         assert resp_full.json()["total"] == resp_one.json()["total"]
@@ -1000,5 +1004,9 @@ class TestHistory:
 
     def test_history_limit_out_of_range_returns_422(self, client: TestClient):
         """limit=0 and limit>50 are out-of-range and must return HTTP 422."""
-        assert client.get("/validate/history", params={"limit": 0}).status_code == 422
-        assert client.get("/validate/history", params={"limit": 51}).status_code == 422
+        assert (
+            client.get("/v1/validate/history", params={"limit": 0}).status_code == 422
+        )
+        assert (
+            client.get("/v1/validate/history", params={"limit": 51}).status_code == 422
+        )

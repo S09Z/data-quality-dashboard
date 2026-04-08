@@ -1,0 +1,61 @@
+meta {
+  name: Summary
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/v1/summary
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  ## Summary
+
+  Returns column statistics and region distribution for the **last validated
+  file**.
+
+  ⚠️ Requires at least one prior call to `POST /validate` (02 or 03).
+  Resets on server restart.
+
+  ### Expected response `200`
+  ```json
+  {
+    "file": "sales.csv",
+    "total_rows": 10,
+    "total_revenue": 1024.68,
+    "columns": [
+      {
+        "column": "quantity",
+        "min": 1.0,
+        "max": 10.0,
+        "mean": 4.3,
+        "null_count": 0
+      },
+      {
+        "column": "unit_price",
+        "min": 9.99,
+        "max": 99.99,
+        "mean": 32.49,
+        "null_count": 1
+      }
+    ],
+    "regions": {
+      "East": 2,
+      "North": 3,
+      "South": 3,
+      "West": 2
+    }
+  }
+  ```
+
+  ### Error responses
+  | Status | Cause |
+  |--------|-------|
+  | 404    | No validation has been run yet |
+}

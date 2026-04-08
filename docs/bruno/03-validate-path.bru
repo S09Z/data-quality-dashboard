@@ -1,0 +1,48 @@
+meta {
+  name: Validate – Server-side Path
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/v1/validate?file_path=/app/data/sales.csv
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  ## Validate – Server-side Path
+
+  Trigger validation by passing an absolute path to a file that already
+  exists on the server (inside the container at `/app/data/`).
+
+  Useful for scheduled pipelines that drop files into the data directory.
+
+  ### Query params
+  | Param | Required | Description |
+  |-------|----------|-------------|
+  | `file_path` | No | Absolute server-side path to a `.csv` or `.parquet` file |
+
+  ### Expected response `200`
+  ```json
+  {
+    "file": "/app/data/sales.csv",
+    "total_rows": 10,
+    "valid_rows": 10,
+    "invalid_rows": 0,
+    "is_valid": true,
+    "errors": []
+  }
+  ```
+
+  ### Error responses
+  | Status | Cause |
+  |--------|-------|
+  | 400    | Path points to an unsupported file extension |
+  | 404    | File does not exist at the given path |
+  | 500    | Internal pipeline failure |
+}
