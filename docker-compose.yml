@@ -1,0 +1,106 @@
+services:
+
+  # ── FastAPI application ──────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: data-quality-dashboard:latest
+    container_name: dqd-app
+    restart: unless-stopped
+
+    # Never expose the app port directly — all traffic goes through nginx
+    expose:
+      - "8000"
+
+    environment:
+      HOST:                 "0.0.0.0"
+      PORT:                 "8000"
+      RELOAD:               "false"
+      LOG_JSON:             "true"
+      LOG_LEVEL:            "INFO"
+      USE_SEMANTIC_SEARCH:  "false"
+
+    env_file:
+      # Optional — create a .env file to override any setting above.
+      # Never commit .env to version control.
+      - path: .env
+        required: false
+
+    volumes:
+      # Persist uploaded / validated data files across container restarts
+      - data-vol:/app/data
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout:  5s
+      retries:  3
+      start_period: 15s
+
+    # Harden the container runtime
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp          # writable scratch space for temp file uploads
+      - /app/.cache   # allow Python bytecode cache writes
+
+    networks:
+      - backend
+
+  # ── nginx reverse-proxy ──────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: dqd-nginx
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+
+    ports:
+      - "80:80"     # HTTP  → redirects to HTTPS
+      - "443:443"   # HTTPS → proxied to app:8000
+
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro   # TLS certs — see scripts/gen_certs.sh
+      - nginx-logs:/var/log/nginx
+
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout:  5s
+      retries:  3
+
+    # Read-only filesystem for the proxy process
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+
+    networks:
+      - frontend
+      - backend
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+# frontend: internet-facing (nginx only)
+# backend:  internal only (nginx ↔ app) — app is never reachable from outside
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true   # no direct internet access from app container
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  data-vol:
+    driver: local
+  nginx-logs:
+    driver: local

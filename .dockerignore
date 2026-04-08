@@ -1,0 +1,54 @@
+# Python runtime artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment managed by uv — never needed inside the image
+.venv/
+
+# uv cache
+.cache/
+.uv/
+
+# Test / coverage artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Ruff cache
+.ruff_cache/
+
+# Git history — not needed in the image
+.git/
+.gitignore
+.github/
+
+# CI / editor config
+.pre-commit-config.yaml
+.vscode/
+.idea/
+
+# Secrets — must NEVER be baked into the image
+.env
+*.pem
+*.key
+*.crt
+
+# Docs / reports — not needed at runtime
+*.md
+SECURITY_REPORT.md
+REPORT.md
+
+# Tests — not needed at runtime
+tests/
+
+# Dev / build files
+Dockerfile
+docker-compose*.yml
+nginx/
+
+# macOS noise
+.DS_Store
