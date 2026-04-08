@@ -315,6 +315,46 @@ class TestValidateExtra:
         assert d["is_valid"] is False
         assert isinstance(d["errors"], list)
 
+    def test_pipeline_repr_before_run(self):
+        """DataPipeline repr before .run() must say status='not run'."""
+        from src.pipeline import DataPipeline
+
+        p = DataPipeline("sales.csv")
+        assert "not run" in repr(p)
+        assert "sales.csv" in repr(p)
+
+    def test_pipeline_repr_after_run_valid(self):
+        """DataPipeline repr after .run() on valid data must say status='valid'."""
+        import tempfile
+
+        from src.pipeline import DataPipeline
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+            f.write(VALID_CSV)
+            p_tmp = f.name
+        try:
+            pipeline = DataPipeline(p_tmp)
+            pipeline.run()
+            assert "valid" in repr(pipeline)
+        finally:
+            Path(p_tmp).unlink(missing_ok=True)
+
+    def test_pipeline_repr_after_run_invalid(self):
+        """DataPipeline repr after .run() on bad data must say status='invalid'."""
+        import tempfile
+
+        from src.pipeline import DataPipeline
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+            f.write(INVALID_CSV_NEG_QTY)
+            p_tmp = f.name
+        try:
+            pipeline = DataPipeline(p_tmp)
+            pipeline.run()
+            assert "invalid" in repr(pipeline)
+        finally:
+            Path(p_tmp).unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Extra unit tests — pipeline.summarize (edge cases)
@@ -528,7 +568,7 @@ class TestAPIExtra:
 
     def test_summary_returns_404_when_no_validate_called(self):
         """With a broken startup (load_csv raises), /summary must return 404."""
-        with patch("src.api.load_csv", side_effect=RuntimeError("no disk")):
+        with patch("src.api.DataPipeline.run", side_effect=RuntimeError("no disk")):
             from src.api import app as fresh_app
 
             with TestClient(fresh_app, raise_server_exceptions=False) as c:
@@ -561,7 +601,7 @@ class TestAPIExtra:
 
     def test_startup_exception_does_not_crash_app(self, tmp_path: Path):
         """Even if the startup pipeline raises, the app should still be reachable."""
-        with patch("src.api.load_csv", side_effect=RuntimeError("disk error")):
+        with patch("src.api.DataPipeline.run", side_effect=RuntimeError("disk error")):
             from src.api import app as fresh_app
 
             with TestClient(fresh_app, raise_server_exceptions=False) as c:
@@ -574,7 +614,9 @@ class TestAPIExtra:
 
         p = tmp_path / "ok.csv"
         p.write_text(VALID_CSV)
-        with patch("src.api.validate", side_effect=RuntimeError("unexpected crash")):
+        with patch(
+            "src.api.DataPipeline.run", side_effect=RuntimeError("unexpected crash")
+        ):
             with TestClient(fresh_app, raise_server_exceptions=False) as c:
                 resp = c.post("/validate", params={"file_path": str(p)})
                 assert resp.status_code == 500
@@ -685,6 +727,36 @@ class TestSettings:
 
 
 # ---------------------------------------------------------------------------
+# HistoryManager unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryManager:
+    def test_repr_shows_size_and_max(self):
+        from src.schemas import HistoryManager
+
+        m = HistoryManager(max_size=10)
+        r = repr(m)
+        assert "size=0" in r
+        assert "max_size=10" in r
+
+    def test_repr_after_push(self):
+        from src.schemas import HistoryManager
+
+        m = HistoryManager(max_size=5)
+        fake = ValidationResult(
+            file="x.csv",
+            total_rows=1,
+            valid_rows=1,
+            invalid_rows=0,
+            errors=[],
+            is_valid=True,
+        )
+        m.push(fake)
+        assert "size=1" in repr(m)
+
+
+# ---------------------------------------------------------------------------
 # SearchEngine BM25 mode property & new constructor args
 # ---------------------------------------------------------------------------
 
@@ -700,22 +772,16 @@ class TestSearchEngineMode:
 
     def test_semantic_mode_raises_without_package(self, monkeypatch):
         """Without sentence-transformers installed the engine should raise ImportError."""
-        import sys
-
-        # Temporarily hide sentence-transformers from imports
-        for mod in list(sys.modules):
-            if "sentence_transformers" in mod or "sentence-transformers" in mod:
-                monkeypatch.delitem(sys.modules, mod, raising=False)
-
-        import haystack.components.embedders as emb_mod
+        from src.search import _SemanticStrategy
 
         with patch.object(
-            emb_mod,
-            "SentenceTransformersDocumentEmbedder",
+            _SemanticStrategy,
+            "_init",
             side_effect=ImportError("no st"),
         ):
+            engine = SearchEngine(semantic=True)
             with pytest.raises((ImportError, Exception)):
-                SearchEngine(semantic=True)
+                engine.index(["test"])
 
     def test_bm25_index_and_query_unchanged(self):
         """Existing BM25 behaviour must be unaffected by constructor change."""
@@ -784,3 +850,155 @@ class TestLoggingConfig:
         monkeypatch.setitem(sys.modules, "pythonjsonlogger.json", None)
         with pytest.raises((ImportError, TypeError)):
             configure_logging(log_level="INFO", log_json=True)
+
+
+# ---------------------------------------------------------------------------
+# History endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestHistory:
+    """Tests for GET /validate/history endpoint."""
+
+    def test_history_returns_200(self, client: TestClient):
+        """GET /validate/history must always return HTTP 200."""
+        resp = client.get("/validate/history")
+        assert resp.status_code == 200
+
+    def test_history_response_schema(self, client: TestClient):
+        """Response must have total, limit, results keys."""
+        resp = client.get("/validate/history")
+        data = resp.json()
+        assert "total" in data
+        assert "limit" in data
+        assert "results" in data
+        assert isinstance(data["results"], list)
+
+    def test_history_populated_after_startup(self, client: TestClient):
+        """Startup pipeline calls validate, so history should have ≥1 entry."""
+        resp = client.get("/validate/history")
+        data = resp.json()
+        # lifespan runs a validate on sales.csv — must appear in history
+        assert data["total"] >= 1
+
+    def test_history_grows_after_validate(self, client: TestClient, tmp_path: Path):
+        """Calling POST /validate should increase total count by 1."""
+        before = client.get("/validate/history").json()["total"]
+        p = tmp_path / "extra.csv"
+        p.write_text(VALID_CSV)
+        client.post("/validate", params={"file_path": str(p)})
+        after = client.get("/validate/history").json()["total"]
+        assert after == before + 1
+
+    def test_history_limit_param(self, client: TestClient):
+        """limit=1 must return at most 1 result."""
+        resp = client.get("/validate/history", params={"limit": 1})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["limit"] == 1
+        assert len(data["results"]) <= 1
+
+    def test_history_limit_default(self, client: TestClient):
+        """Default limit is 10 — response must reflect that."""
+        resp = client.get("/validate/history")
+        data = resp.json()
+        assert data["limit"] == 10
+        assert len(data["results"]) <= 10
+
+    def test_history_results_are_validation_results(self, client: TestClient):
+        """Every item in results must look like a ValidationResult."""
+        resp = client.get("/validate/history")
+        for item in resp.json()["results"]:
+            assert "file" in item
+            assert "total_rows" in item
+            assert "valid_rows" in item
+            assert "invalid_rows" in item
+            assert "is_valid" in item
+            assert "errors" in item
+            assert isinstance(item["errors"], list)
+
+    def test_history_newest_first(self, client: TestClient, tmp_path: Path):
+        """Results must be in reverse-chronological order (newest first)."""
+        # Validate two different files sequentially so we know the order
+        p1 = tmp_path / "hist_a.csv"
+        p2 = tmp_path / "hist_b.csv"
+        p1.write_text(VALID_CSV)
+        p2.write_text(VALID_CSV)
+
+        client.post("/validate", params={"file_path": str(p1)})
+        client.post("/validate", params={"file_path": str(p2)})
+
+        resp = client.get("/validate/history", params={"limit": 2})
+        results = resp.json()["results"]
+        assert len(results) == 2
+        # The most-recently validated file (p2) must come first
+        assert results[0]["file"] == str(p2)
+        assert results[1]["file"] == str(p1)
+
+    def test_history_bounded_at_max_size(self):
+        """History must never exceed HISTORY_MAX_SIZE=50 entries."""
+        from src.api import HISTORY_MAX_SIZE, app
+        from src.schemas import HistoryManager
+
+        # Build a fresh app context with manually-inflated history
+        with TestClient(app) as c:
+            # Inject 60 fake entries via HistoryManager (bypasses cap intentionally)
+            fake_result = ValidationResult(
+                file="fake.csv",
+                total_rows=1,
+                valid_rows=1,
+                invalid_rows=0,
+                errors=[],
+                is_valid=True,
+            )
+            manager = HistoryManager(max_size=HISTORY_MAX_SIZE)
+            manager._items = [fake_result] * 60  # force-fill past the cap
+            c.app.state.history = manager
+            # Now POST /validate once more — history should stay ≤ HISTORY_MAX_SIZE
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".csv", mode="w", delete=False
+            ) as f:
+                f.write(VALID_CSV)
+                p_tmp = f.name
+            try:
+                c.post("/validate", params={"file_path": p_tmp})
+            finally:
+                Path(p_tmp).unlink(missing_ok=True)
+
+            resp = c.get("/validate/history", params={"limit": 50})
+            data = resp.json()
+            assert data["total"] <= HISTORY_MAX_SIZE
+
+    def test_history_total_reflects_all_not_just_limit(
+        self, client: TestClient, tmp_path: Path
+    ):
+        """total must reflect the entire accumulated history, not just the current page."""
+        # Use a fresh isolated app context so accumulated history from other
+        # module-scoped tests cannot interfere with the total count.
+        from src.api import app as isolated_app
+
+        with TestClient(isolated_app) as c:
+            initial_total = c.get("/validate/history").json()["total"]
+            # Add 3 entries so we know exactly how many were added here
+            for i in range(3):
+                p = tmp_path / f"batch_{i}.csv"
+                p.write_text(VALID_CSV)
+                c.post("/validate", params={"file_path": str(p)})
+
+            resp_full = c.get("/validate/history", params={"limit": 50})
+            resp_one = c.get("/validate/history", params={"limit": 1})
+
+        # total must be the same regardless of limit
+        assert resp_full.json()["total"] == resp_one.json()["total"]
+        # limit fields must differ
+        assert resp_full.json()["limit"] == 50
+        assert resp_one.json()["limit"] == 1
+        # total grew by exactly 3
+        assert resp_full.json()["total"] == initial_total + 3
+
+    def test_history_limit_out_of_range_returns_422(self, client: TestClient):
+        """limit=0 and limit>50 are out-of-range and must return HTTP 422."""
+        assert client.get("/validate/history", params={"limit": 0}).status_code == 422
+        assert client.get("/validate/history", params={"limit": 51}).status_code == 422
