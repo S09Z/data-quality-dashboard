@@ -36,6 +36,10 @@ Thumbs.db
 .env.*
 !.env.example
 
+# TLS certificates — never commit private keys
+nginx/certs/*.key
+nginx/certs/*.crt
+
 # Data (keep sample CSV, ignore large/generated files)
 data/*.parquet
 data/generated_*
