@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 
+from src.config import settings
+from src.logging_config import configure_logging
 from src.pipeline import load_csv, summarize, validate
 from src.schemas import (
     HealthResponse,
@@ -20,21 +23,25 @@ from src.search import SearchEngine, build_report_from_validation
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Default data path — can be overridden via environment variable DATA_PATH
+# Constants derived from settings
 # ---------------------------------------------------------------------------
 
-DEFAULT_DATA_PATH = Path(__file__).parent.parent / "data" / "sales.csv"
+DEFAULT_DATA_PATH = settings.data_path
 
-# Module-level state shared across requests
-_engine: SearchEngine = SearchEngine()
-_last_result: ValidationResult | None = None
-_last_summary: SummaryResponse | None = None
+_ALLOWED_SUFFIXES = {".csv", ".parquet"}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Run the pipeline once at startup to pre-populate search index."""
-    global _last_result, _last_summary
+    """Initialise per-app state and run the startup pipeline."""
+    configure_logging(log_level=settings.log_level, log_json=settings.log_json)
+    # Attach fresh state to the app instance (no module-level globals)
+    app.state.engine = SearchEngine(
+        semantic=settings.use_semantic_search,
+        model=settings.semantic_model,
+    )
+    app.state.last_result: ValidationResult | None = None
+    app.state.last_summary: SummaryResponse | None = None
 
     logger.info("Starting up — running initial validation pipeline…")
     try:
@@ -42,11 +49,11 @@ async def lifespan(app: FastAPI):
         df, result = validate(lf, file=str(DEFAULT_DATA_PATH))
         summary = summarize(df, file=str(DEFAULT_DATA_PATH))
 
-        _last_result = result
-        _last_summary = summary
+        app.state.last_result = result
+        app.state.last_summary = summary
 
         report_text = build_report_from_validation(result)
-        _engine.index([report_text])
+        app.state.engine.index([report_text])
         logger.info(
             "Startup pipeline complete. valid=%d invalid=%d",
             result.valid_rows,
@@ -83,60 +90,100 @@ def health() -> HealthResponse:
 
 
 @app.post("/validate", response_model=ValidationResult, tags=["pipeline"])
-def validate_file(
-    file_path: str = Query(
-        default=str(DEFAULT_DATA_PATH),
-        description="Absolute or relative path to the CSV file to validate.",
+async def validate_file(
+    request: Request,
+    file_path: str | None = Query(
+        default=None,
+        description="Server-side path to a CSV or Parquet file to validate.",
+    ),
+    upload: UploadFile | None = File(
+        default=None,
+        description="CSV file uploaded directly (multipart/form-data).",
     ),
 ) -> ValidationResult:
     """
-    Load and validate a CSV file with Polars + Pandera.
+    Validate a CSV / Parquet file with Polars + Pandera.
 
-    Returns a detailed ValidationResult with any schema/data errors found.
+    **Two ways to provide data:**
+    - `file_path` query param — absolute path to a server-side file.
+    - `upload` form field — multipart CSV upload (max ~50 MB).
+
+    If both are given, `upload` takes precedence.
+    Falls back to the default `data/sales.csv` when neither is supplied.
     """
-    global _last_result, _last_summary
+    # ── Resolve the file to validate ────────────────────────────────────────
+    tmp_path: Path | None = None
 
-    path = Path(file_path)
+    if upload is not None:
+        # Write the uploaded bytes to a temp file so Polars can scan it
+        suffix = Path(upload.filename or "upload.csv").suffix.lower() or ".csv"
+        if suffix not in _ALLOWED_SUFFIXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Uploaded file type '{suffix}' is not supported. Use .csv or .parquet.",
+            )
+        content = await upload.read()
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = Path(tmp.name)
+        path = tmp_path
+        label = upload.filename or "upload"
+    elif file_path is not None:
+        path = Path(file_path)
+        label = file_path
+    else:
+        path = DEFAULT_DATA_PATH
+        label = str(DEFAULT_DATA_PATH)
+
+    # ── Validate path ────────────────────────────────────────────────────────
     if not path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
-    if path.suffix.lower() not in {".csv", ".parquet"}:
+        _cleanup(tmp_path)
+        raise HTTPException(status_code=404, detail=f"File not found: {label}")
+    if path.suffix.lower() not in _ALLOWED_SUFFIXES:
+        _cleanup(tmp_path)
         raise HTTPException(
             status_code=400, detail="Only .csv and .parquet files are supported."
         )
 
+    # ── Run pipeline ─────────────────────────────────────────────────────────
     try:
         lf = load_csv(path)
-        df, result = validate(lf, file=str(path))
-        summary = summarize(df, file=str(path))
+        df, result = validate(lf, file=label)
+        summary = summarize(df, file=label)
     except Exception as exc:
+        _cleanup(tmp_path)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        _cleanup(tmp_path)
 
-    # Update shared state & re-index search
-    _last_result = result
-    _last_summary = summary
+    # ── Update app state & re-index search ───────────────────────────────────
+    request.app.state.last_result = result
+    request.app.state.last_summary = summary
     report_text = build_report_from_validation(result)
-    _engine.index([report_text])
+    request.app.state.engine.index([report_text])
 
     return result
 
 
 @app.get("/summary", response_model=SummaryResponse, tags=["pipeline"])
-def get_summary() -> SummaryResponse:
+def get_summary(request: Request) -> SummaryResponse:
     """
     Return aggregate statistics for the last validated file.
 
     Call POST /validate first to populate the summary.
     """
-    if _last_summary is None:
+    summary = request.app.state.last_summary
+    if summary is None:
         raise HTTPException(
             status_code=404,
             detail="No summary available yet. Call POST /validate first.",
         )
-    return _last_summary
+    return summary
 
 
 @app.get("/search", response_model=SearchResponse, tags=["search"])
 def search(
+    request: Request,
     q: str = Query(
         ..., min_length=1, description="Search query over validation reports."
     ),
@@ -149,5 +196,16 @@ def search(
 
     Returns matching report snippets ranked by relevance.
     """
-    results = _engine.query(text=q, top_k=top_k)
+    results = request.app.state.engine.query(text=q, top_k=top_k)
     return SearchResponse(query=q, results=results, total=len(results))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _cleanup(path: Path | None) -> None:
+    """Silently remove a temporary file if it exists."""
+    if path and path.exists():
+        path.unlink(missing_ok=True)

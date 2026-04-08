@@ -17,7 +17,10 @@ from src.schemas import (
 
 
 def load_csv(path: str | Path) -> pl.LazyFrame:
-    """Scan a CSV file lazily with Polars."""
+    """Scan a CSV or Parquet file lazily with Polars."""
+    path = Path(path)
+    if path.suffix.lower() == ".parquet":
+        return pl.scan_parquet(str(path))
     return pl.scan_csv(str(path))
 
 

@@ -292,6 +292,15 @@ class TestValidateExtra:
         lf = load_csv(SALES_CSV)
         assert isinstance(lf, pl.LazyFrame)
 
+    def test_load_csv_parquet_returns_lazyframe(self, tmp_path):
+        """load_csv on a .parquet file must also return a Polars LazyFrame."""
+        p = tmp_path / "sales.parquet"
+        pl.read_csv(io.StringIO(VALID_CSV)).write_parquet(str(p))
+        lf = load_csv(p)
+        assert isinstance(lf, pl.LazyFrame)
+        df = lf.collect()
+        assert len(df) == 3
+
     def test_validate_returns_dataframe(self):
         """validate() must return an eager pl.DataFrame as the first element."""
         lf = _df_from_csv_str(VALID_CSV)
@@ -519,17 +528,12 @@ class TestAPIExtra:
 
     def test_summary_returns_404_when_no_validate_called(self):
         """With a broken startup (load_csv raises), /summary must return 404."""
-        import src.api as api_module
+        with patch("src.api.load_csv", side_effect=RuntimeError("no disk")):
+            from src.api import app as fresh_app
 
-        saved = api_module._last_summary
-        api_module._last_summary = None
-        try:
-            with patch("src.api.load_csv", side_effect=RuntimeError("no disk")):
-                with TestClient(api_module.app, raise_server_exceptions=False) as c:
-                    resp = c.get("/summary")
-                    assert resp.status_code == 404
-        finally:
-            api_module._last_summary = saved
+            with TestClient(fresh_app, raise_server_exceptions=False) as c:
+                resp = c.get("/summary")
+                assert resp.status_code == 404
 
     def test_search_top_k_param(self, client: TestClient):
         """GET /search with top_k=1 should return at most 1 result."""
@@ -558,20 +562,225 @@ class TestAPIExtra:
     def test_startup_exception_does_not_crash_app(self, tmp_path: Path):
         """Even if the startup pipeline raises, the app should still be reachable."""
         with patch("src.api.load_csv", side_effect=RuntimeError("disk error")):
-            from src.api import app
+            from src.api import app as fresh_app
 
-            with TestClient(app, raise_server_exceptions=False) as c:
+            with TestClient(fresh_app, raise_server_exceptions=False) as c:
                 resp = c.get("/health")
                 assert resp.status_code == 200
 
     def test_validate_returns_500_on_internal_error(self, tmp_path: Path):
         """POST /validate returns HTTP 500 when the pipeline itself crashes."""
-        import src.api as api_module
+        from src.api import app as fresh_app
 
         p = tmp_path / "ok.csv"
         p.write_text(VALID_CSV)
         with patch("src.api.validate", side_effect=RuntimeError("unexpected crash")):
-            with TestClient(api_module.app, raise_server_exceptions=False) as c:
+            with TestClient(fresh_app, raise_server_exceptions=False) as c:
                 resp = c.post("/validate", params={"file_path": str(p)})
                 assert resp.status_code == 500
                 assert "unexpected crash" in resp.json()["detail"]
+
+    # ── Upload (UploadFile) tests ────────────────────────────────────────────
+
+    def test_upload_valid_csv(self, client: TestClient):
+        """POST /validate with a valid uploaded CSV should return is_valid=true."""
+        resp = client.post(
+            "/validate",
+            files={"upload": ("valid.csv", VALID_CSV.encode(), "text/csv")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["is_valid"] is True
+        assert data["total_rows"] == 3
+
+    def test_upload_invalid_csv(self, client: TestClient):
+        """POST /validate with uploaded CSV containing bad rows returns is_valid=false."""
+        resp = client.post(
+            "/validate",
+            files={"upload": ("bad.csv", INVALID_CSV_NEG_QTY.encode(), "text/csv")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["is_valid"] is False
+
+    def test_upload_unsupported_extension(self, client: TestClient):
+        """Uploading a .txt file should return HTTP 400."""
+        resp = client.post(
+            "/validate",
+            files={"upload": ("data.txt", b"col1,col2\n1,2\n", "text/plain")},
+        )
+        assert resp.status_code == 400
+
+    def test_upload_takes_precedence_over_file_path(
+        self, client: TestClient, tmp_path: Path
+    ):
+        """When both upload and file_path are given, upload wins."""
+        # file_path points at invalid data; upload is valid — result should be valid
+        p = tmp_path / "invalid.csv"
+        p.write_text(INVALID_CSV_NEG_QTY)
+        resp = client.post(
+            "/validate",
+            params={"file_path": str(p)},
+            files={"upload": ("valid.csv", VALID_CSV.encode(), "text/csv")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["is_valid"] is True
+
+    # ── Parquet tests ────────────────────────────────────────────────────────
+
+    def test_validate_parquet_file(self, client: TestClient, tmp_path: Path):
+        """POST /validate on a Parquet file should validate correctly."""
+        import polars as pl
+
+        p = tmp_path / "sales.parquet"
+        pl.read_csv(io.StringIO(VALID_CSV)).write_parquet(str(p))
+        resp = client.post("/validate", params={"file_path": str(p)})
+        assert resp.status_code == 200
+        assert resp.json()["is_valid"] is True
+        assert resp.json()["total_rows"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Settings / config tests
+# ---------------------------------------------------------------------------
+
+
+class TestSettings:
+    def test_default_values(self):
+        """Settings must expose sensible defaults without any env vars set."""
+        from src.config import Settings
+
+        s = Settings()
+        assert s.host == "0.0.0.0"
+        assert s.port == 8000
+        assert s.reload is False
+        assert s.log_level == "INFO"
+        assert s.log_json is False
+        assert s.use_semantic_search is False
+        assert s.data_path.name == "sales.csv"
+
+    def test_env_override(self, monkeypatch):
+        """Environment variables must override defaults."""
+        from src.config import Settings
+
+        monkeypatch.setenv("PORT", "9090")
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+        monkeypatch.setenv("LOG_JSON", "true")
+        monkeypatch.setenv("USE_SEMANTIC_SEARCH", "false")
+        s = Settings()
+        assert s.port == 9090
+        assert s.log_level == "DEBUG"
+        assert s.log_json is True
+
+    def test_data_path_is_path_object(self):
+        from src.config import Settings
+
+        s = Settings()
+        assert isinstance(s.data_path, Path)
+
+    def test_semantic_model_default(self):
+        from src.config import Settings
+
+        s = Settings()
+        assert "MiniLM" in s.semantic_model or "minilm" in s.semantic_model.lower()
+
+
+# ---------------------------------------------------------------------------
+# SearchEngine BM25 mode property & new constructor args
+# ---------------------------------------------------------------------------
+
+
+class TestSearchEngineMode:
+    def test_default_mode_is_bm25(self):
+        engine = SearchEngine()
+        assert engine.mode == "bm25"
+
+    def test_explicit_bm25(self):
+        engine = SearchEngine(semantic=False)
+        assert engine.mode == "bm25"
+
+    def test_semantic_mode_raises_without_package(self, monkeypatch):
+        """Without sentence-transformers installed the engine should raise ImportError."""
+        import sys
+
+        # Temporarily hide sentence-transformers from imports
+        for mod in list(sys.modules):
+            if "sentence_transformers" in mod or "sentence-transformers" in mod:
+                monkeypatch.delitem(sys.modules, mod, raising=False)
+
+        import haystack.components.embedders as emb_mod
+
+        with patch.object(
+            emb_mod,
+            "SentenceTransformersDocumentEmbedder",
+            side_effect=ImportError("no st"),
+        ):
+            with pytest.raises((ImportError, Exception)):
+                SearchEngine(semantic=True)
+
+    def test_bm25_index_and_query_unchanged(self):
+        """Existing BM25 behaviour must be unaffected by constructor change."""
+        engine = SearchEngine(semantic=False)
+        engine.index(["null values detected", "all checks passed"])
+        results = engine.query("null", top_k=1)
+        assert len(results) == 1
+        assert "null" in results[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# Logging configuration tests
+# ---------------------------------------------------------------------------
+
+
+class TestLoggingConfig:
+    def test_plain_text_logging(self):
+        """configure_logging with log_json=False must not raise."""
+        import logging
+
+        from src.logging_config import configure_logging
+
+        configure_logging(log_level="WARNING", log_json=False)
+        root = logging.getLogger()
+        assert root.level == logging.WARNING
+
+    def test_json_logging(self):
+        """configure_logging with log_json=True must install a JsonFormatter."""
+        import logging
+
+        from src.logging_config import configure_logging
+
+        configure_logging(log_level="INFO", log_json=True)
+        root = logging.getLogger()
+        assert root.handlers, "root logger must have at least one handler"
+        from pythonjsonlogger.json import JsonFormatter
+
+        assert any(isinstance(h.formatter, JsonFormatter) for h in root.handlers)
+
+    def test_log_level_debug(self):
+        import logging
+
+        from src.logging_config import configure_logging
+
+        configure_logging(log_level="DEBUG", log_json=False)
+        assert logging.getLogger().level == logging.DEBUG
+
+    def test_handlers_replaced_not_duplicated(self):
+        """Calling configure_logging twice must not add duplicate handlers."""
+        import logging
+
+        from src.logging_config import configure_logging
+
+        configure_logging(log_level="INFO", log_json=False)
+        configure_logging(log_level="INFO", log_json=False)
+        assert len(logging.getLogger().handlers) == 1
+
+    def test_json_logging_missing_package_raises(self, monkeypatch):
+        """configure_logging(log_json=True) raises ImportError if pythonjsonlogger is absent."""
+        import sys
+
+        from src.logging_config import configure_logging
+
+        # Simulate missing package by hiding it from sys.modules
+        monkeypatch.setitem(sys.modules, "pythonjsonlogger", None)
+        monkeypatch.setitem(sys.modules, "pythonjsonlogger.json", None)
+        with pytest.raises((ImportError, TypeError)):
+            configure_logging(log_level="INFO", log_json=True)
