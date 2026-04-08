@@ -1,0 +1,11 @@
+order_id,product,quantity,unit_price,order_date,region
+ORD-001,Widget A,5,9.99,2024-01-15,North
+ORD-002,Widget B,3,19.99,2024-01-16,South
+ORD-003,Widget C,2,14.99,2024-01-17,East
+ORD-004,Gadget X,10,49.99,2024-01-18,West
+ORD-005,Gadget Y,1,99.99,2024-01-19,North
+ORD-006,Widget A,4,9.99,2024-01-20,South
+ORD-007,Gadget Z,7,34.99,2024-01-21,East
+ORD-008,Widget B,-1,19.99,2024-01-22,West
+ORD-009,Widget C,2,,2024-01-23,North
+ORD-010,Gadget X,0,49.99,2024-01-24,South
